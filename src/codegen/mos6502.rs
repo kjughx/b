@@ -34,6 +34,14 @@ macro_rules! instr_enum {
             )*
             return None;
         }
+        pub unsafe fn instr_to_string(ins: Instr) -> *const c_char {
+            $(
+                if matches!(ins, $n::$instr) {
+                    return c!(stringify!($instr));
+                }
+            )*
+            unreachable!();
+        }
     }
 }
 
@@ -86,6 +94,32 @@ pub enum AddrMode {
 
     COUNT
 }
+unsafe fn arg8_to_string(mode: AddrMode, v: u8) -> *const c_char {
+    use AddrMode::*;
+    match mode {
+        IMPL => c!(""),
+        IMM => temp_sprintf(c!("#0x%02x"), v as c_uint),
+        ZP | ZP_X | ZP_Y | REL => temp_sprintf(c!("$0x%02x"), v as c_uint),
+        IND_X => temp_sprintf(c!("($0x%02x,x)"), v as c_uint),
+        IND_Y => temp_sprintf(c!("(0x%02x),y"), v as c_uint),
+        _ => unreachable!(),
+    }
+}
+
+unsafe fn arg16_to_string(mode: AddrMode, v: u16) -> *const c_char {
+    use AddrMode::*;
+    match mode {
+        IMPL => c!(""),
+        IMM => temp_sprintf(c!("#0x%04x"), v as c_uint),
+        ABS => temp_sprintf(c!("$0x%04x"), v as c_uint),
+        ABS_X => temp_sprintf(c!("$0x%04x,x"), v as c_uint),
+        ABS_Y => temp_sprintf(c!("$0x%04x,y"), v as c_uint),
+        IND => temp_sprintf(c!("($0x%04x)"), v as c_uint),
+        _ => unreachable!(),
+    }
+}
+
+
 use Instr::*;
 use AddrMode::*;
 
@@ -252,6 +286,8 @@ pub struct Assembler {
     pub addresses: Array<u16>,
     pub code_start: u16, // load address of code section
     pub frame_sz: u8, // current stack frame size in bytes, because 6502 has no base register
+    pub output: *mut String_Builder,
+    pub assembly: String_Builder,
 }
 
 pub unsafe fn write_byte(out: *mut String_Builder, byte: u8) {
@@ -269,29 +305,43 @@ pub unsafe fn write_word_at(out: *mut String_Builder, word: u16, addr: u16) {
     write_byte_at(out, (word>>8) as u8, addr+1);
 }
 
-pub unsafe fn instr0(out: *mut String_Builder, inst: Instr, mode: AddrMode) {
+pub unsafe fn instr0(asm: *mut Assembler, inst: Instr, mode: AddrMode) {
     let opcode = OPCODES[inst as usize][mode as usize];
     if opcode == INVL {
         printf(c!("Invalid combination of opcode and operand %u and %u\n"),
                inst as usize, mode as usize);
         abort();
     }
-    write_byte(out, opcode);
+    write_byte((*asm).output, opcode);
 }
 // IMPL (implied) addressing mode
-pub unsafe fn instr(out: *mut String_Builder, inst: Instr) {
-    instr0(out, inst, IMPL);
+pub unsafe fn instr(asm: *mut Assembler, inst: Instr) {
+    instr0(asm, inst, IMPL);
+    sb_appendf(&mut (*asm).assembly, c!("  %s\n"), instr_to_string(inst));
 }
-pub unsafe fn instr8(out: *mut String_Builder, inst: Instr, mode: AddrMode, v: u8) {
-    instr0(out, inst, mode);
-    write_byte(out, v);
+pub unsafe fn instr_label(asm: *mut Assembler, inst: Instr, mode: AddrMode, label: usize) {
+    instr0(asm, inst, mode);
+    let kind = match mode {
+        AddrMode::REL => RelocationKind::AddressRel{idx: label},
+        AddrMode::ABS => RelocationKind::AddressAbs{idx: label},
+        _ => unreachable!(),
+    };
+    add_reloc(asm, kind);
+    sb_appendf(&mut (*asm).assembly, c!("  %s label_%zu\n"), instr_to_string(inst), label);
 }
-pub unsafe fn instr16(out: *mut String_Builder, inst: Instr, mode: AddrMode, v: u16) {
-    instr0(out, inst, mode);
-    write_word(out, v);
+pub unsafe fn instr8(asm: *mut Assembler, inst: Instr, mode: AddrMode, v: u8) {
+    instr0(asm, inst, mode);
+    write_byte((*asm).output, v);
+    sb_appendf(&mut (*asm).assembly, c!("  %s %s\n"), instr_to_string(inst), arg8_to_string(mode, v));
+}
+pub unsafe fn instr16(asm: *mut Assembler, inst: Instr, mode: AddrMode, v: u16) {
+    instr0(asm, inst, mode);
+    write_word((*asm).output, v);
+    sb_appendf(&mut (*asm).assembly, c!("  %s %s\n"), instr_to_string(inst), arg16_to_string(mode, v));
 }
 
-pub unsafe fn add_reloc(out: *mut String_Builder, kind: RelocationKind, asm: *mut Assembler) {
+pub unsafe fn add_reloc(asm: *mut Assembler, kind: RelocationKind) {
+    let out = (*asm).output;
     da_append(&mut (*asm).relocs, Relocation {
         kind,
         addr: (*out).count as u16
@@ -308,9 +358,9 @@ pub unsafe fn create_address_label(asm: *mut Assembler) -> usize {
     da_append(&mut (*asm).addresses, 0);
     idx
 }
-pub unsafe fn create_address_label_here(out: *const String_Builder, asm: *mut Assembler) -> usize {
+pub unsafe fn create_address_label_here(asm: *mut Assembler) -> usize {
     let label = create_address_label(asm);
-    link_address_label_here(label, out, asm);
+    link_address_label_here(asm, label);
     label
 }
 
@@ -318,56 +368,57 @@ pub unsafe fn create_address_label_here(out: *const String_Builder, asm: *mut As
 pub unsafe fn link_address_label(label: usize, addr: u16, asm: *mut Assembler) {
     *(*asm).addresses.items.add(label) = addr;
 }
-pub unsafe fn link_address_label_here(label: usize, out: *const String_Builder, asm: *mut Assembler) {
-    *(*asm).addresses.items.add(label) = (*out).count as u16;
+pub unsafe fn link_address_label_here(asm: *mut Assembler, label: usize) {
+    *(*asm).addresses.items.add(label) = (*((*asm).output)).count as u16;
+    sb_appendf(&mut (*asm).assembly, c!("label_%zu:\n"), label);
 }
 
-pub unsafe fn load_auto_var(out: *mut String_Builder, index: usize, asm: *mut Assembler) {
+pub unsafe fn load_auto_var(asm: *mut Assembler, index: usize) {
     // save current stack pointer
-    instr(out, TSX);
+    instr(asm, TSX);
     // load low byte
-    instr16(out, LDA, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2 - 1);
+    instr16(asm, LDA, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2 - 1);
     // load high byte
-    instr16(out, LDY, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2);
+    instr16(asm, LDY, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2);
 }
 
-pub unsafe fn load_arg(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut Assembler) {
+pub unsafe fn load_arg(asm: *mut Assembler, arg: Arg, loc: Loc) {
     match arg {
         Arg::Deref(index) => {
-            load_auto_var(out, index, asm);
+            load_auto_var(asm, index);
 
             // load address to buffer in ZP to dereference, because registers
             // only 8 bits
-            instr8(out, STA, ZP, ZP_DEREF_0);
-            instr8(out, STY, ZP, ZP_DEREF_1);
+            instr8(asm, STA, ZP, ZP_DEREF_0);
+            instr8(asm, STY, ZP, ZP_DEREF_1);
 
             // Y = ((0),1)
-            instr8(out, LDY, IMM, 1);
-            instr8(out, LDA, IND_Y, ZP_DEREF_0);
-            instr(out, TAY);
+            instr8(asm, LDY, IMM, 1);
+            instr8(asm, LDA, IND_Y, ZP_DEREF_0);
+            instr(asm, TAY);
 
             // A = ((0,0))
-            instr8(out, LDX, IMM, 0);
-            instr8(out, LDA, IND_X, ZP_DEREF_0);
+            instr8(asm, LDX, IMM, 0);
+            instr8(asm, LDA, IND_X, ZP_DEREF_0);
         },
         Arg::RefAutoVar(index)  => {
             let auto_var_address = STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2 - 1;
 
             // save current stack pointer
-            instr(out, TSX);
+            instr(asm, TSX);
 
             // load address low byte
-            instr(out, TXA);
+            instr(asm, TXA);
 
-            instr(out, CLC);
-            instr8(out, ADC, IMM, (auto_var_address & 0xFF) as u8);
+            instr(asm, CLC);
+            instr8(asm, ADC, IMM, (auto_var_address & 0xFF) as u8);
 
-            instr8(out, STA, ZP, ZP_TMP_0);
-            instr8(out, LDA, IMM, 0);
-            instr8(out, ADC, IMM, (auto_var_address >> 8) as u8);
+            instr8(asm, STA, ZP, ZP_TMP_0);
+            instr8(asm, LDA, IMM, 0);
+            instr8(asm, ADC, IMM, (auto_var_address >> 8) as u8);
 
-            instr(out, TAY);
-            instr8(out, LDA, ZP, ZP_TMP_0);
+            instr(asm, TAY);
+            instr8(asm, LDA, ZP, ZP_TMP_0);
         }
         Arg::RefExternal(name)  => {
             // TODO: Understand why the test ref does not give the correct value to y
@@ -376,114 +427,114 @@ pub unsafe fn load_arg(arg: Arg, loc: Loc, out: *mut String_Builder, asm: *mut A
             //     y: 410 410 410 410 410
 
             // load address low byte
-            instr8(out, LDA, IMM, 0);
+            instr8(asm, LDA, IMM, 0);
 
-            instr(out, CLC);
-            instr0(out, ADC, IMM);
-            add_reloc(out, RelocationKind::External{name, byte:0}, asm);
+            instr(asm, CLC);
+            instr0(asm, ADC, IMM);
+            add_reloc(asm, RelocationKind::External{name, byte:0});
 
-            instr8(out, STA, ZP, ZP_TMP_0);
+            instr8(asm, STA, ZP, ZP_TMP_0);
 
-            instr8(out, LDA, IMM, 0);
-            instr0(out, ADC, IMM);
-            add_reloc(out, RelocationKind::External{name, byte:1}, asm);
+            instr8(asm, LDA, IMM, 0);
+            instr0(asm, ADC, IMM);
+            add_reloc(asm, RelocationKind::External{name, byte:1});
 
-            instr(out, TAY);
-            instr8(out, LDA, ZP, ZP_TMP_0);
+            instr(asm, TAY);
+            instr8(asm, LDA, ZP, ZP_TMP_0);
         },
         Arg::External(name)     => {
-            instr8(out, LDX, IMM, 0);
+            instr8(asm, LDX, IMM, 0);
 
-            instr0(out, LDA, ABS_X);
-            add_reloc(out, RelocationKind::External{name, byte: 2}, asm);
+            instr0(asm, LDA, ABS_X);
+            add_reloc(asm, RelocationKind::External{name, byte: 2});
 
-            instr8(out, LDX, IMM, 1);
+            instr8(asm, LDX, IMM, 1);
             // load high byte
-            instr0(out, LDY, ABS_X);
-            add_reloc(out, RelocationKind::External{name, byte: 2}, asm);
+            instr0(asm, LDY, ABS_X);
+            add_reloc(asm, RelocationKind::External{name, byte: 2});
         },
         Arg::AutoVar(index)     => {
-            load_auto_var(out, index, asm);
+            load_auto_var(asm, index);
         },
         Arg::Literal(value) => {
             if value >= 65536 {
                 diagf!(loc, c!("WARNING: contant $%X out of range for 16 bits\n"), value);
             }
-            instr8(out, LDA, IMM, value as u8);
-            instr8(out, LDY, IMM, (value >> 8) as u8);
+            instr8(asm, LDA, IMM, value as u8);
+            instr8(asm, LDY, IMM, (value >> 8) as u8);
         },
         Arg::DataOffset(offset) => {
             assert!(offset < 65536, "data offset out of range");
-            instr0(out, LDA, IMM);
-            add_reloc(out, RelocationKind::DataOffset{off: offset as u16, low: true}, asm);
-            instr0(out, LDY, IMM);
-            add_reloc(out, RelocationKind::DataOffset{off: (offset + 1) as u16, low: false}, asm);
+            instr0(asm, LDA, IMM);
+            add_reloc(asm, RelocationKind::DataOffset{off: offset as u16, low: true});
+            instr0(asm, LDY, IMM);
+            add_reloc(asm, RelocationKind::DataOffset{off: (offset + 1) as u16, low: false});
         },
         Arg::Bogus => unreachable!("bogus-amogus"),
     };
 }
 
-pub unsafe fn store_auto(out: *mut String_Builder, index: usize, asm: *mut Assembler) {
+pub unsafe fn store_auto(asm: *mut Assembler, index: usize) {
     // save current stack pointer
-    instr(out, TSX);
+    instr(asm, TSX);
     // save low byte
-    instr16(out, STA, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2 - 1);
+    instr16(asm, STA, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2 - 1);
 
     // save high byte
-    instr(out, TYA);
-    instr16(out, STA, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2);
+    instr(asm, TYA);
+    instr16(asm, STA, ABS_X, STACK_PAGE + (*asm).frame_sz as u16 - (index-1) as u16 * 2);
 }
 
 // TODO: can this be done better?
-pub unsafe fn add_sp(out: *mut String_Builder, bytes: u8, asm: *mut Assembler) {
+pub unsafe fn add_sp(asm: *mut Assembler, bytes: u8) {
     (*asm).frame_sz -= bytes;
     if bytes < 8 {
         for _ in 0 .. bytes {
-            instr(out, PLA);
+            instr(asm, PLA);
         }
     } else {
-        instr(out, TSX);
-        instr(out, TXA);
-        instr(out, CLC);
-        instr8(out, ADC, IMM, bytes);
-        instr(out, TAX);
-        instr(out, TXS);
+        instr(asm, TSX);
+        instr(asm, TXA);
+        instr(asm, CLC);
+        instr8(asm, ADC, IMM, bytes);
+        instr(asm, TAX);
+        instr(asm, TXS);
     }
 }
 // cannot modify Y:A here, as they hold first argument
 // TODO: look, if this can be done without a loop, like in `add_sp` without modifying
 // Y:A. Either save them temporarily or write the first arg to stack before decrementing
 // SP
-pub unsafe fn sub_sp(out: *mut String_Builder, bytes: u8, asm: *mut Assembler) {
+pub unsafe fn sub_sp(asm: *mut Assembler, bytes: u8) {
     (*asm).frame_sz += bytes;
     for _ in 0 .. bytes {
-        instr(out, PHA);
+        instr(asm, PHA);
     }
 }
-pub unsafe fn push16(out: *mut String_Builder, asm: *mut Assembler) {
+pub unsafe fn push16(asm: *mut Assembler) {
     (*asm).frame_sz += 2;
 
-    instr(out, TAX);
-    instr(out, TYA);
+    instr(asm, TAX);
+    instr(asm, TYA);
     // push high byte first
-    instr(out, PHA);
-    instr(out, TXA);
+    instr(asm, PHA);
+    instr(asm, TXA);
     // then low
-    instr(out, PHA);
+    instr(asm, PHA);
 }
-pub unsafe fn pop16_discard(out: *mut String_Builder, asm: *mut Assembler) {
+pub unsafe fn pop16_discard(asm: *mut Assembler) {
     (*asm).frame_sz -= 2;
 
-    instr(out, PLA);
-    instr(out, PLA);
+    instr(asm, PLA);
+    instr(asm, PLA);
 }
 
 // load lhs in Y:A, rhs in RHS_L:RHS_H
-pub unsafe fn load_two_args(out: *mut String_Builder, lhs: Arg, rhs: Arg, op: OpWithLocation, asm: *mut Assembler) {
-    load_arg(rhs, op.loc, out, asm);
-    instr8(out, STA, ZP, ZP_RHS_L);
-    instr8(out, STY, ZP, ZP_RHS_H);
-    load_arg(lhs, op.loc, out, asm);
+pub unsafe fn load_two_args(asm: *mut Assembler, lhs: Arg, rhs: Arg, op: OpWithLocation) {
+    load_arg(asm, rhs, op.loc);
+    instr8(asm, STA, ZP, ZP_RHS_L);
+    instr8(asm, STY, ZP, ZP_RHS_H);
+    load_arg(asm, lhs, op.loc);
 }
 
 // TODO: maybe recover from errors?
@@ -697,9 +748,9 @@ pub unsafe fn assemble_statement(out: *mut String_Builder,
     }
 }
 
-pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_vars_count: usize,
-                                body: *const [OpWithLocation], out: *mut String_Builder,
-                                asm: *mut Assembler) {
+pub unsafe fn generate_function(asm: *mut Assembler, name: *const c_char, params_count: usize, auto_vars_count: usize,
+                                body: *const [OpWithLocation]) {
+    let out = (*asm).output;
     (*asm).frame_sz = 0;
     let fun_addr = (*out).count as u16;
     da_append(&mut (*asm).functions, Function {
@@ -719,27 +770,27 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
     // TODO: use params_count, auto_vars_count
     assert!(auto_vars_count*2 < 256);
     let stack_size = (auto_vars_count * 2) as u8;
-    sub_sp(out, stack_size, asm);
+    sub_sp(asm, stack_size);
 
     for i in 0..(params_count as u16) {
-        instr(out, TSX);
+        instr(asm, TSX);
         if i == 0 {
             // low
-            instr16(out, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i - 1);
+            instr16(asm, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i - 1);
 
             // high
-            instr(out, TYA);
-            instr16(out, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i);
+            instr(asm, TYA);
+            instr16(asm, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i);
             continue;
         }
 
         // low
-        instr16(out, LDA, ABS_X, STACK_PAGE + stack_size as u16 + 2*i + 1);
-        instr16(out, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i - 1);
+        instr16(asm, LDA, ABS_X, STACK_PAGE + stack_size as u16 + 2*i + 1);
+        instr16(asm, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i - 1);
 
         // high
-        instr16(out, LDA, ABS_X, STACK_PAGE + stack_size as u16 + 2*i + 2);
-        instr16(out, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i);
+        instr16(asm, LDA, ABS_X, STACK_PAGE + stack_size as u16 + 2*i + 2);
+        instr16(asm, STA, ABS_X, STACK_PAGE + stack_size as u16 - 2*i);
     }
 
     for i in 0..body.len() {
@@ -751,104 +802,143 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
             Op::Bogus => unreachable!("bogus-amogus"),
             Op::Return {arg} => {
                 if let Some(arg) = arg {
-                    load_arg(arg, op.loc, out, asm);
+                    load_arg(asm, arg, op.loc);
                 }
 
                 // jump to ret statement
-                instr0(out, JMP, ABS);
-                add_reloc(out, RelocationKind::AddressAbs
-                          {idx: *op_addresses.items.add(body.len())}, asm);
+                instr0(asm, JMP, ABS);
+                add_reloc(asm, RelocationKind::AddressAbs
+                          {idx: *op_addresses.items.add(body.len())});
             },
             Op::Store {index, arg} => {
-                load_auto_var(out, index, asm);
-                instr8(out, STA, ZP, ZP_DEREF_STORE_0);
-                instr8(out, STY, ZP, ZP_DEREF_STORE_1);
+                load_auto_var(asm, index);
+                instr8(asm, STA, ZP, ZP_DEREF_STORE_0);
+                instr8(asm, STY, ZP, ZP_DEREF_STORE_1);
 
-                load_arg(arg, op.loc, out, asm);
-                instr(out, TAX);
-                instr(out, TYA);
+                load_arg(asm, arg, op.loc);
+                instr(asm, TAX);
+                instr(asm, TYA);
 
-                instr8(out, LDY, IMM, 1);
-                instr8(out, STA, IND_Y, ZP_DEREF_STORE_0); // high
-                instr(out, DEY);
-                instr(out, TXA);
-                instr8(out, STA, IND_Y, ZP_DEREF_STORE_0); // low
+                instr8(asm, LDY, IMM, 1);
+                instr8(asm, STA, IND_Y, ZP_DEREF_STORE_0); // high
+                instr(asm, DEY);
+                instr(asm, TXA);
+                instr8(asm, STA, IND_Y, ZP_DEREF_STORE_0); // low
             },
             Op::ExternalAssign{name: _, arg: _} => missingf!(op.loc, c!("implement ExternalAssign\n")),
             Op::AutoAssign{index, arg} => {
-                load_arg(arg, op.loc, out, asm);
-                store_auto(out, index, asm);
+                load_arg(asm, arg, op.loc);
+                store_auto(asm, index);
             },
             Op::Negate {result: _, arg: _} => missingf!(op.loc, c!("implement Negate\n")),
             Op::UnaryNot{result, arg} => {
-                load_arg(arg, op.loc, out, asm);
+                load_arg(asm, arg, op.loc);
 
-                instr8(out, LDX, IMM, 0);
+                instr8(asm, LDX, IMM, 0);
 
-                instr8(out, CMP, IMM, 0);
-                instr8(out, BNE, REL, 6);
+                instr8(asm, CMP, IMM, 0);
+                instr8(asm, BNE, REL, 6);
 
-                instr(out, TYA);
-                instr8(out, CMP, IMM, 0);
-                instr8(out, BNE, REL, 1);
+                instr(asm, TYA);
+                instr8(asm, CMP, IMM, 0);
+                instr8(asm, BNE, REL, 1);
 
-                instr(out, INX);
+                instr(asm, INX);
 
-                instr(out, TXA);
-                instr8(out, LDY, IMM, 0);
+                instr(asm, TXA);
+                instr8(asm, LDY, IMM, 0);
 
-                store_auto(out, result, asm);
+                store_auto(asm, result);
             },
             Op::Binop {binop, index, lhs, rhs} => {
                 match binop {
                     Binop::BitOr => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
-                        instr8(out, ORA, ZP, ZP_RHS_L);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8(out, ORA, ZP, ZP_RHS_H);
-                        instr(out, TAY);
-                        instr(out, TXA);
+                        instr8(asm, ORA, ZP, ZP_RHS_L);
+                        instr(asm, TAX);
+                        instr(asm, TYA);
+                        instr8(asm, ORA, ZP, ZP_RHS_H);
+                        instr(asm, TAY);
+                        instr(asm, TXA);
                     },
                     Binop::BitAnd => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
-                        instr8(out, AND, ZP, ZP_RHS_L);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8(out, AND, ZP, ZP_RHS_H);
-                        instr(out, TAY);
-                        instr(out, TXA);
+                        instr8(asm, AND, ZP, ZP_RHS_L);
+                        instr(asm, TAX);
+                        instr(asm, TYA);
+                        instr8(asm, AND, ZP, ZP_RHS_H);
+                        instr(asm, TAY);
+                        instr(asm, TXA);
                     },
                     Binop::BitShl => missingf!(op.loc, c!("implement BitShl\n")),
                     Binop::BitShr => missingf!(op.loc, c!("implement BitShr\n")),
                     Binop::Plus => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
-                        instr(out, CLC);
-                        instr8(out, ADC, ZP, ZP_RHS_L);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8(out, ADC, ZP, ZP_RHS_H);
-                        instr(out, TAY);
-                        instr(out, TXA);
+                        instr(asm, CLC);
+                        instr8(asm, ADC, ZP, ZP_RHS_L);
+                        instr(asm, TAX);
+                        instr(asm, TYA);
+                        instr8(asm, ADC, ZP, ZP_RHS_H);
+                        instr(asm, TAY);
+                        instr(asm, TXA);
                     },
                     Binop::Minus  => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
-                        instr(out, SEC);
-                        instr8(out, SBC, ZP, ZP_RHS_L);
-                        instr(out, TAX);
-                        instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
-                        instr(out, TAY);
-                        instr(out, TXA);
+                        instr(asm, SEC);
+                        instr8(asm, SBC, ZP, ZP_RHS_L);
+                        instr(asm, TAX);
+                        instr(asm, TYA);
+                        instr8(asm, SBC, ZP, ZP_RHS_H);
+                        instr(asm, TAY);
+                        instr(asm, TXA);
                     },
                     Binop::Mod => missingf!(op.loc, c!("implement Mod\n")),
-                    Binop::Div => missingf!(op.loc, c!("implement Div\n")),
+                    Binop::Div => {
+                        load_two_args(asm, lhs, rhs, op);
+                        instr8(asm, STA, ZP, ZP_TMP_0);
+                        instr8(asm, STY, ZP, ZP_TMP_1);
+                        instr8(asm, LDX, IMM, 0);
+                        instr8(asm, STX, ZP, ZP_TMP_2); // low-byte of result
+                        instr8(asm, STX, ZP, ZP_TMP_3); // high-byte of result
+
+                        let loop_start = create_address_label_here(asm);
+                        let cont = create_address_label(asm);
+                        let finished = create_address_label(asm);
+
+                        instr(asm, SEC);
+                        instr8(asm, SBC, ZP, ZP_RHS_L);
+                        instr8(asm, STA, ZP, ZP_TMP_0);
+
+                        instr8(asm, LDA, ZP, ZP_TMP_1);
+                        instr8(asm, SBC, ZP, ZP_RHS_H);
+                        instr8(asm, STA, ZP, ZP_TMP_1);
+
+                        instr_label(asm, BMI, REL, finished);
+                        add_reloc(asm, RelocationKind::AddressRel{idx: finished});
+                        instr0(asm, BEQ, REL);
+                        add_reloc(asm, RelocationKind::AddressRel{idx: finished});
+
+                        instr8(asm, LDA, ZP, ZP_TMP_0);
+                        instr8(asm, INC, ZP, ZP_TMP_2);
+                        instr0(asm, BNE, REL);
+                        add_reloc(asm, RelocationKind::AddressRel{idx: cont});
+                        instr8(asm, INC, ZP, ZP_TMP_3);
+
+                        link_address_label_here(asm, cont);
+                        instr0(asm, JMP, ABS);
+                        add_reloc(asm, RelocationKind::AddressAbs{idx: loop_start});
+
+                        link_address_label_here(asm, finished);
+                        instr8(asm, LDA, ZP, ZP_TMP_2);
+                        instr8(asm, LDY, ZP, ZP_TMP_3);
+
+                    }
                     Binop::Mult => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
                         // TODO: maybe move this to an intrinsic function,
                         // because it is rather long. Consider this, if we run
@@ -861,219 +951,219 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
 
                         // from here on: unsigned multiplication
                         // store lhs
-                        instr8(out, STA, ZP, ZP_TMP_0);
-                        instr8(out, STY, ZP, ZP_TMP_1);
+                        instr8(asm, STA, ZP, ZP_TMP_0);
+                        instr8(asm, STY, ZP, ZP_TMP_1);
 
                         // store Y:A in ZP, because shifting and adding is easier
                         // without all the register switching
-                        instr8(out, LDA, IMM, 0);
-                        instr8(out, STA, ZP, ZP_TMP_2);
-                        instr8(out, STA, ZP, ZP_TMP_3);
+                        instr8(asm, LDA, IMM, 0);
+                        instr8(asm, STA, ZP, ZP_TMP_2);
+                        instr8(asm, STA, ZP, ZP_TMP_3);
 
-                        let loop_start = create_address_label_here(out, asm);
+                        let loop_start = create_address_label_here(asm);
                         let cont = create_address_label(asm);
                         let finished = create_address_label(asm);
 
                         // if both zero [-> A = 0], we are finished
-                        instr8(out, LDA, ZP, ZP_RHS_L);
-                        instr0(out, BNE, REL);
-                        add_reloc(out, RelocationKind::AddressRel{idx: cont}, asm);
-                        instr8(out, LDA, ZP, ZP_RHS_H);
-                        instr0(out, BNE, REL);
-                        add_reloc(out, RelocationKind::AddressRel{idx: cont}, asm);
+                        instr8(asm, LDA, ZP, ZP_RHS_L);
+                        instr0(asm, BNE, REL);
+                        add_reloc(asm, RelocationKind::AddressRel{idx: cont});
+                        instr8(asm, LDA, ZP, ZP_RHS_H);
+                        instr0(asm, BNE, REL);
+                        add_reloc(asm, RelocationKind::AddressRel{idx: cont});
 
-                        instr0(out, JMP, ABS);
-                        add_reloc(out, RelocationKind::AddressAbs{idx: finished}, asm);
+                        instr0(asm, JMP, ABS);
+                        add_reloc(asm, RelocationKind::AddressAbs{idx: finished});
 
-                        link_address_label_here(cont, out, asm);
+                        link_address_label_here(asm, cont);
 
                         // shift left current accumulater between single adds
-                        instr8(out, ASL, ZP, ZP_TMP_2);
-                        instr8(out, ROL, ZP, ZP_TMP_3);
+                        instr8(asm, ASL, ZP, ZP_TMP_2);
+                        instr8(asm, ROL, ZP, ZP_TMP_3);
 
-                        instr8(out, ASL, ZP, ZP_RHS_L);
-                        instr8(out, ROL, ZP, ZP_RHS_H);
+                        instr8(asm, ASL, ZP, ZP_RHS_L);
+                        instr8(asm, ROL, ZP, ZP_RHS_H);
 
                         // if bit is 0, do not add anything
-                        instr0(out, BCC, REL);
-                        add_reloc(out, RelocationKind::AddressRel{idx: loop_start}, asm);
+                        instr0(asm, BCC, REL);
+                        add_reloc(asm, RelocationKind::AddressRel{idx: loop_start});
 
                         // bit is 1 here, we have to add entire lhs to acc
-                        instr(out, CLC);
-                        instr8(out, LDA, ZP, ZP_TMP_2); // acc, low
-                        instr8(out, ADC, ZP, ZP_TMP_0); // lhs, low
-                        instr8(out, STA, ZP, ZP_TMP_2); // acc, low
+                        instr(asm, CLC);
+                        instr8(asm, LDA, ZP, ZP_TMP_2); // acc, low
+                        instr8(asm, ADC, ZP, ZP_TMP_0); // lhs, low
+                        instr8(asm, STA, ZP, ZP_TMP_2); // acc, low
 
-                        instr8(out, LDA, ZP, ZP_TMP_3); // acc, high
-                        instr8(out, ADC, ZP, ZP_TMP_1); // lhs, high
-                        instr8(out, STA, ZP, ZP_TMP_3); // acc, high
+                        instr8(asm, LDA, ZP, ZP_TMP_3); // acc, high
+                        instr8(asm, ADC, ZP, ZP_TMP_1); // lhs, high
+                        instr8(asm, STA, ZP, ZP_TMP_3); // acc, high
 
                         // continue loop
-                        instr0(out, JMP, ABS);
-                        add_reloc(out, RelocationKind::AddressAbs{idx: loop_start}, asm);
-                        link_address_label_here(finished, out, asm);
+                        instr0(asm, JMP, ABS);
+                        add_reloc(asm, RelocationKind::AddressAbs{idx: loop_start});
+                        link_address_label_here(asm, finished);
 
                         // move back in Y:A
-                        instr8(out, LDA, ZP, ZP_TMP_2);
-                        instr8(out, LDY, ZP, ZP_TMP_3);
+                        instr8(asm, LDA, ZP, ZP_TMP_2);
+                        instr8(asm, LDY, ZP, ZP_TMP_3);
                     },
                     Binop::Less => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
                         // we subtract, then check sign
 
-                        instr8(out, LDX, IMM, 1);
+                        instr8(asm, LDX, IMM, 1);
 
-                        instr(out, SEC); // set carry
+                        instr(asm, SEC); // set carry
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8(asm, SBC, ZP, ZP_RHS_L);
                         // sub high byte
-                        instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr(asm, TYA);
+                        instr8(asm, SBC, ZP, ZP_RHS_H);
                         // high result in A, N flag if less.
 
                         // if less skip, we already have X=1
-                        instr8(out, BMI, REL, 1);
-                        instr(out, DEX);
-                        instr(out, TXA);
+                        instr8(asm, BMI, REL, 1);
+                        instr(asm, DEX);
+                        instr(asm, TXA);
                         // zero extend result
-                        instr8(out, LDY, IMM, 0);
+                        instr8(asm, LDY, IMM, 0);
                     },
                     Binop::Greater => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
                         // we subtract, then check sign
 
-                        instr8(out, LDX, IMM, 1);
+                        instr8(asm, LDX, IMM, 1);
 
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8(asm, SBC, ZP, ZP_RHS_L);
                         // sub high byte
-                        instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr(asm, TYA);
+                        instr8(asm, SBC, ZP, ZP_RHS_H);
                         // high result in A, N flag if less.
 
                         // if greater skip, we already have X=1
-                        instr8(out, BPL, REL, 1);
+                        instr8(asm, BPL, REL, 1);
 
-                        instr(out, DEX);
-                        instr(out, TXA);
+                        instr(asm, DEX);
+                        instr(asm, TXA);
                         // zero extend result
-                        instr8(out, LDY, IMM, 0);
+                        instr8(asm, LDY, IMM, 0);
                     },
                     Binop::Equal => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
-                        instr8(out, LDX, IMM, 0);
+                        instr8(asm, LDX, IMM, 0);
 
-                        instr8(out, CMP, ZP, ZP_RHS_L);
-                        instr8(out, BNE, REL, 5);
+                        instr8(asm, CMP, ZP, ZP_RHS_L);
+                        instr8(asm, BNE, REL, 5);
 
-                        instr8(out, CPY, ZP, ZP_RHS_H);
-                        instr8(out, BNE, REL, 1);
+                        instr8(asm, CPY, ZP, ZP_RHS_H);
+                        instr8(asm, BNE, REL, 1);
 
-                        instr(out, INX);
-                        instr(out, TXA);
-                        instr8(out, LDY, IMM, 0);
+                        instr(asm, INX);
+                        instr(asm, TXA);
+                        instr8(asm, LDY, IMM, 0);
                     },
                     Binop::NotEqual => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
 
-                        instr8(out, LDX, IMM, 1);
+                        instr8(asm, LDX, IMM, 1);
 
-                        instr8(out, CMP, ZP, ZP_RHS_L);
-                        instr8(out, BNE, REL, 5);
+                        instr8(asm, CMP, ZP, ZP_RHS_L);
+                        instr8(asm, BNE, REL, 5);
 
-                        instr8(out, CPY, ZP, ZP_RHS_H);
-                        instr8(out, BNE, REL, 1);
+                        instr8(asm, CPY, ZP, ZP_RHS_H);
+                        instr8(asm, BNE, REL, 1);
 
-                        instr(out, DEX);
-                        instr(out, TXA);
-                        instr8(out, LDY, IMM, 0);
+                        instr(asm, DEX);
+                        instr(asm, TXA);
+                        instr8(asm, LDY, IMM, 0);
                     },
                     Binop::GreaterEqual => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
                         // we subtract, then check sign
 
-                        instr8(out, LDX, IMM, 0);
+                        instr8(asm, LDX, IMM, 0);
 
-                        instr(out, SEC); // set carry
+                        instr(asm, SEC); // set carry
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8(asm, SBC, ZP, ZP_RHS_L);
                         // sub high byte
-                        instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr(asm, TYA);
+                        instr8(asm, SBC, ZP, ZP_RHS_H);
                         // high result in A, N flag if less.
 
                         // if less skip, we already have X=0
-                        instr8(out, BMI, REL, 1);
-                        instr(out, INX);
-                        instr(out, TXA);
+                        instr8(asm, BMI, REL, 1);
+                        instr(asm, INX);
+                        instr(asm, TXA);
                         // zero extend result
-                        instr8(out, LDY, IMM, 0);
+                        instr8(asm, LDY, IMM, 0);
                     },
                     Binop::LessEqual => {
-                        load_two_args(out, lhs, rhs, op, asm);
+                        load_two_args(asm, lhs, rhs, op);
                         // we subtract, then check sign
 
-                        instr8(out, LDX, IMM, 0);
+                        instr8(asm, LDX, IMM, 0);
 
                         // sub low byte
-                        instr8(out, SBC, ZP, ZP_RHS_L);
+                        instr8(asm, SBC, ZP, ZP_RHS_L);
                         // sub high byte
-                        instr(out, TYA);
-                        instr8(out, SBC, ZP, ZP_RHS_H);
+                        instr(asm, TYA);
+                        instr8(asm, SBC, ZP, ZP_RHS_H);
                         // high result in A, N flag if less.
 
                         // if greater skip, we already have X=0
-                        instr8(out, BPL, REL, 1);
-                        instr(out, INX);
-                        instr(out, TXA);
+                        instr8(asm, BPL, REL, 1);
+                        instr(asm, INX);
+                        instr(asm, TXA);
                         // zero extend result
-                        instr8(out, LDY, IMM, 0);
+                        instr8(asm, LDY, IMM, 0);
                     },
                 }
-                store_auto(out, index, asm);
+                store_auto(asm, index);
             },
             Op::Funcall{result, fun, args} => {
                 match fun {
                     Arg::RefExternal(_) | Arg::External(_) => {},
                     arg => {
-                        load_arg(arg, op.loc, out, asm);
-                        instr8(out, STA, ZP, ZP_DEREF_FUN_0);
-                        instr8(out, STY, ZP, ZP_DEREF_FUN_1);
+                        load_arg(asm, arg, op.loc);
+                        instr8(asm, STA, ZP, ZP_DEREF_FUN_0);
+                        instr8(asm, STY, ZP, ZP_DEREF_FUN_1);
                     }
                 }
 
                 for i in (0..args.count).rev() {
-                    load_arg(*args.items.add(i), op.loc, out, asm);
+                    load_arg(asm, *args.items.add(i), op.loc);
                     // first arg in Y:A to be compatible with wozmon routines
                     if i != 0 {
-                        push16(out, asm);
+                        push16(asm);
                     }
                 }
                 match fun {
                     Arg::RefExternal(name) | Arg::External(name) => {
-                        instr0(out, JSR, ABS);
-                        add_reloc(out, RelocationKind::Function{name}, asm);
+                        instr0(asm, JSR, ABS);
+                        add_reloc(asm, RelocationKind::Function{name});
                     },
                     _ => { // function pointer already loaded in ZP_DEREF_FUN
                         // there is no jsr (indirect), so emulate using jsr and jmp (indirect).
-                        instr16(out, JSR, ABS, (*asm).code_start + (*out).count as u16 + 6);
-                        instr16(out, JMP, ABS, (*asm).code_start + (*out).count as u16 + 6);
-                        instr16(out, JMP, IND, ZP_DEREF_FUN_0 as u16);
+                        instr16(asm, JSR, ABS, (*asm).code_start + (*out).count as u16 + 6);
+                        instr16(asm, JMP, ABS, (*asm).code_start + (*out).count as u16 + 6);
+                        instr16(asm, JMP, IND, ZP_DEREF_FUN_0 as u16);
                     },
                 }
                 if args.count > 1 {
-                    instr(out, TAX);
+                    instr(asm, TAX);
                     // clear stack
                     for i in 0 .. args.count {
                         if i == 0 {
                             continue;
                         }
-                        pop16_discard(out, asm);
+                        pop16_discard(asm);
                     }
-                    instr(out, TXA);
+                    instr(asm, TXA);
                 }
-                store_auto(out, result, asm);
+                store_auto(asm, result);
             },
             Op::Asm {stmts} => {
                 for i in 0..stmts.count {
@@ -1087,7 +1177,7 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                 // > risky to just blindly jump on an address that could possibly be unused.
                 //
                 // Assess the risk and potentially remove this NOP
-                instr(out, NOP);
+                instr(asm, NOP);
                 da_append(&mut (*asm).op_labels, Label {
                     func_name: name,
                     label,
@@ -1095,42 +1185,42 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
                 });
             },
             Op::JmpLabel{label} => {
-                instr0(out, JMP, ABS);
-                add_reloc(out, RelocationKind::Label{func_name: name, label}, asm);
+                instr0(asm, JMP, ABS);
+                add_reloc(asm, RelocationKind::Label{func_name: name, label});
             },
             Op::JmpIfNotLabel{label, arg} => {
-                load_arg(arg, op.loc, out, asm);
+                load_arg(asm, arg, op.loc);
 
-                instr8(out, CMP, IMM, 0);
+                instr8(asm, CMP, IMM, 0);
 
                 // if !=0, skip next check and branch
-                instr8(out, BNE, REL, 7); // skip next 4 instructions
-                instr8(out, CPY, IMM, 0);
-                instr8(out, BNE, REL, 3);
+                instr8(asm, BNE, REL, 7); // skip next 4 instructions
+                instr8(asm, CPY, IMM, 0);
+                instr8(asm, BNE, REL, 3);
 
-                instr0(out, JMP, ABS);
-                add_reloc(out, RelocationKind::Label{func_name: name, label}, asm);
+                instr0(asm, JMP, ABS);
+                add_reloc(asm, RelocationKind::Label{func_name: name, label});
             },
         }
     }
 
-    instr8(out, LDA, IMM, 0);
-    instr(out, TAY);
+    instr8(asm, LDA, IMM, 0);
+    instr(asm, TAY);
     let addr_idx = *op_addresses.items.add(body.len());
     *(*asm).addresses.items.add(addr_idx) = (*out).count as u16; // update op address
 
     if stack_size > 0 {
         // seriously... we don't have enough registers to save A to...
-        instr8(out, STA, ZP, ZP_RHS_L);
-        add_sp(out, stack_size, asm);
-        instr8(out, LDA, ZP, ZP_RHS_L);
+        instr8(asm, STA, ZP, ZP_RHS_L);
+        add_sp(asm, stack_size);
+        instr8(asm, LDA, ZP, ZP_RHS_L);
     }
-    instr(out, RTS);
+    instr(asm, RTS);
 }
 
-pub unsafe fn generate_funcs(out: *mut String_Builder, funcs: *const [Func], asm: *mut Assembler) {
+pub unsafe fn generate_funcs(asm: *mut Assembler, funcs: *const [Func]) {
     for i in 0..funcs.len() {
-        generate_function((*funcs)[i].name, (*funcs)[i].params_count, (*funcs)[i].auto_vars_count, da_slice((*funcs)[i].body), out, asm);
+        generate_function(asm, (*funcs)[i].name, (*funcs)[i].params_count, (*funcs)[i].auto_vars_count, da_slice((*funcs)[i].body));
     }
 }
 
@@ -1205,8 +1295,9 @@ pub unsafe fn apply_relocations(out: *mut String_Builder, data_start: u16, asm: 
     }
 }
 
-pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c_char],
-                              funcs: *const [Func], globals: *const [Global], asm: *mut Assembler) {
+pub unsafe fn generate_extrns(asm: *mut Assembler, extrns: *const [*const c_char],
+                              funcs: *const [Func], globals: *const [Global]) {
+    let out = (*asm).output;
     'skip_function_or_global: for i in 0..extrns.len() {
         // assemble a few "stdlib" functions which can't be programmed in B
         let name = (*extrns)[i];
@@ -1233,31 +1324,31 @@ pub unsafe fn generate_extrns(out: *mut String_Builder, extrns: *const [*const c
                 addr: fun_addr,
             });
 
-            instr(out, TSX);
-            instr(out, CLC);
-            instr16(out, ADC, ABS_X, STACK_PAGE + 2 + 1); // low
+            instr(asm, TSX);
+            instr(asm, CLC);
+            instr16(asm, ADC, ABS_X, STACK_PAGE + 2 + 1); // low
 
             // load address to buffer in ZP to dereference, because registers
             // only 8 bits
-            instr8(out, STA, ZP, ZP_DEREF_0);
+            instr8(asm, STA, ZP, ZP_DEREF_0);
 
-            instr(out, TYA);
-            instr16(out, ADC, ABS_X, STACK_PAGE + 2 + 2); // high
-            instr8(out, STA, ZP, ZP_DEREF_1);
+            instr(asm, TYA);
+            instr16(asm, ADC, ABS_X, STACK_PAGE + 2 + 2); // high
+            instr8(asm, STA, ZP, ZP_DEREF_1);
 
-            instr8(out, LDX, IMM, 0);
+            instr8(asm, LDX, IMM, 0);
 
             // A = ((0))
-            instr8(out, LDA, IND_X, ZP_DEREF_0);
+            instr8(asm, LDA, IND_X, ZP_DEREF_0);
 
             // sign extend Y
-            instr8(out, LDY, IMM, 0);
+            instr8(asm, LDY, IMM, 0);
 
-            instr8(out, CMP, IMM, 0);
-            instr8(out, BPL, REL, 1);
-            instr(out, DEY);
+            instr8(asm, CMP, IMM, 0);
+            instr8(asm, BPL, REL, 1);
+            instr(asm, DEY);
 
-            instr(out, RTS);
+            instr(asm, RTS);
         } else {
             fprintf(stderr(), c!("Unknown extrn: `%s`, can not link\n"), name);
             abort();
@@ -1277,10 +1368,10 @@ pub unsafe fn generate_globals(out: *mut String_Builder, globals: *mut [Global],
             for j in 0..global.values.count {
                 match *global.values.items.add(j) {
                     ImmediateValue::Literal(lit) => write_word(out, lit as u16),
-                    ImmediateValue::Name(name) => add_reloc(out, RelocationKind::External{name, byte:2}, asm),
+                    ImmediateValue::Name(name) => add_reloc(asm, RelocationKind::External{name, byte:2}),
                     ImmediateValue::DataOffset(offset) => {
-                        add_reloc(out, RelocationKind::DataOffset{off: offset as u16, low: true}, asm);
-                        add_reloc(out, RelocationKind::DataOffset{off: offset as u16, low: false}, asm);
+                        add_reloc(asm, RelocationKind::DataOffset{off: offset as u16, low: true});
+                        add_reloc(asm, RelocationKind::DataOffset{off: offset as u16, low: false});
                     }
                 }
             }
@@ -1301,11 +1392,11 @@ pub unsafe fn generate_data_section(out: *mut String_Builder, data: *const [u8])
     }
 }
 
-pub unsafe fn generate_entry(out: *mut String_Builder, asm: *mut Assembler) {
-    instr0(out, JSR, ABS);
-    add_reloc(out, RelocationKind::Function{name: c!("main")}, asm);
+pub unsafe fn generate_entry(asm: *mut Assembler) {
+    instr0(asm, JSR, ABS);
+    add_reloc(asm, RelocationKind::Function{name: c!("main")});
 
-    instr16(out, JMP, IND, 0xFFFC);
+    instr16(asm, JMP, IND, 0xFFFC);
 }
 
 pub unsafe fn parse_config_from_link_flags(link_flags: *const[*const c_char]) -> Option<Config> {
@@ -1331,8 +1422,8 @@ pub unsafe fn parse_config_from_link_flags(link_flags: *const[*const c_char]) ->
     Some(config)
 }
 
-pub unsafe fn generate_asm_funcs(out: *mut String_Builder, asm_funcs: *const [AsmFunc],
-                                 asm: *mut Assembler) {
+pub unsafe fn generate_asm_funcs(asm: *mut Assembler, asm_funcs: *const [AsmFunc]) {
+    let out = (*asm).output;
     for i in 0..asm_funcs.len() {
         let asm_func = (*asm_funcs)[i];
 
@@ -1351,17 +1442,19 @@ pub unsafe fn generate_asm_funcs(out: *mut String_Builder, asm_funcs: *const [As
 
 pub unsafe fn generate_program(out: *mut String_Builder, c: *const Compiler, config: Config) -> Option<()> {
     let mut asm: Assembler = zeroed();
-    generate_entry(out, &mut asm);
+    asm.output = out;
+    generate_entry(&mut asm);
     asm.code_start = config.load_offset;
 
-    generate_funcs(out, da_slice((*c).funcs), &mut asm);
-    generate_asm_funcs(out, da_slice((*c).asm_funcs), &mut asm);
-    generate_extrns(out, da_slice((*c).extrns), da_slice((*c).funcs), da_slice((*c).globals), &mut asm);
+    generate_funcs(&mut asm, da_slice((*c).funcs));
+    generate_asm_funcs(&mut asm, da_slice((*c).asm_funcs));
+    generate_extrns(&mut asm, da_slice((*c).extrns), da_slice((*c).funcs), da_slice((*c).globals));
 
     let data_start = config.load_offset + (*out).count as u16;
     generate_data_section(out, da_slice((*c).data));
     generate_globals(out, da_slice((*c).globals), &mut asm);
 
     apply_relocations(out, data_start, &mut asm);
+    write_entire_file(c!("./build/test.asm"), asm.assembly.items as *const c_void, asm.assembly.count);
     Some(())
 }

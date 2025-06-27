@@ -17,15 +17,6 @@ malloc() {
 // TODO: Try to implement this function with assembly
 // Problem with this implementation is that it is not
 // mapped to the operator
-div (a, b) {
-    auto d;
-    d = 0; while(a >= b) {
-        a = a - b;
-        d++;
-    }
-    return (d);
-}
-
 // TODO: Try to implement this function with assembly
 // Problem with this implementation is that it is not
 // mapped to the operator
@@ -43,7 +34,7 @@ printn(n, b) {
     // Simple implementation of the reminder (because too
     // difficult to implement directly in assembly)
 
-    if(a=div(n, b)) /* assignment, not test for equality */
+    if(a= ( n / b)) /* assignment, not test for equality */
         printn(a, b); /* recursive */
     c = rem(n,b) + '0';
     if (c > '9') c += 7;
